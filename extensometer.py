@@ -395,7 +395,7 @@ def detect_start(L, n0, k=5.0, min_px=0.5, run=3):
     return None
 
 
-def detect_break(L, ok, neck, jump_k, jump_min_px, neck_break_px, start):
+def detect_break(L, ok, neck, jump_k, jump_min_px, neck_break_px, start, jump_ratio=4.0):
     """Первый кадр, который уже «после разрыва», и причина."""
     n = len(L)
     cands = []
@@ -416,9 +416,14 @@ def detect_break(L, ok, neck, jump_k, jump_min_px, neck_break_px, start):
         sigma = 1.4826 * np.median(np.abs(dL[good] - med))
         thr = max(jump_k * sigma, jump_min_px)
         jumps = np.nonzero(good & (np.abs(dL - med) > thr))[0]
-        jumps = jumps[jumps >= first]
-        if len(jumps):
-            cands.append((jumps[0] + 1, f"скачок L ({dL[jumps[0]]:+.2f} px за кадр)"))
+        for j in jumps[jumps >= first]:
+            # пропущенный камерой кадр даёт двойной шаг — разрыв же во много раз больше текущего шага
+            prev = dL[max(0, j - 15):j]
+            prev = prev[np.isfinite(prev)]
+            local = abs(np.median(prev)) if len(prev) else 0.0
+            if abs(dL[j]) > jump_ratio * local:
+                cands.append((j + 1, f"скачок L ({dL[j]:+.2f} px за кадр)"))
+                break
     if not cands:
         return None, "разрыв не найден"
     return min(cands, key=lambda c: c[0])
@@ -479,6 +484,7 @@ class Options:
     neck_break_px: float = 0
     jump_k: float = 10
     jump_min_px: float = 2.0
+    jump_ratio: float = 4.0         # скачок должен быть во столько раз больше текущего шага (защита от пропуска кадров)
     l0_frames: int = 10
     stop_after_lost: int = 30
     l0_mm: float = None
@@ -580,6 +586,101 @@ def track_video(video, roi1, roi2, opt, start_frame=0, end_frame=None,
     return tr
 
 
+class LiveTracker:
+    """Онлайн-трекинг меток во время записи: текущее ΔL и обнаружение разрыва.
+
+    Разрыв ищется теми же признаками, что и при анализе (перемычка исчезла, скачок L,
+    потеря метки), но только после того, как образец начал растягиваться, — чтобы рука
+    оператора или шум до старта машины не останавливали запись."""
+
+    def __init__(self, gray, roi1, roi2, opt, log=print):
+        mk = dict(method=opt.method, search=opt.search, dark=not opt.bright_marks,
+                  min_score=opt.min_score, update_thr=opt.update_thr, log=log)
+        self.opt = opt
+        self.m1, self.m2 = Marker(gray, roi1, **mk), Marker(gray, roi2, **mk)
+        self.neck = None
+        if opt.neck:
+            L = np.hypot(*(self.m2.pos - self.m1.pos))
+            halfw = opt.neck_halfwidth or max(20, int(0.5 * L))
+            margin = opt.neck_margin if opt.neck_margin is not None else 0.6 * max(max(roi1[2:]), max(roi2[2:]))
+            try:
+                self.neck = Neck(gray, self.m1.pos, self.m2.pos, halfw, margin)
+            except ValueError as e:
+                log(f"Анализ шейки отключён: {e}.")
+        self.p1, self.p2 = self.m1.pos.copy(), self.m2.pos.copy()
+        self.ok = True
+        self.L = float(np.hypot(*(self.p2 - self.p1)))
+        self.L0 = None
+        self._base = [self.L]
+        self.neck_w = np.nan
+        self.started = False
+        self.broken = False
+        self.reason = ""
+        self.t_break = None
+        self._diffs = []
+        self._low_neck = 0
+        self._lost = 0
+        self._ref_L = self.L
+        self.t_last_move = None
+
+    def rois(self):
+        """Текущие рамки меток (для анализа записанного видео с первого кадра)."""
+        out = []
+        for m in (self.m1, self.m2):
+            w, h = m.size
+            out.append((int(round(m.pos[0] - (w - 1) / 2)), int(round(m.pos[1] - (h - 1) / 2)), w, h))
+        return out
+
+    def dL(self):
+        return None if self.L0 is None or not self.ok else self.L - self.L0
+
+    def update(self, frame, t):
+        gray = to_gray(frame)
+        r1, r2 = self.m1.update(gray), self.m2.update(gray)
+        self.ok = r1 is not None and r2 is not None
+        self.p1, self.p2 = self.m1.pos.copy(), self.m2.pos.copy()
+        if self.t_last_move is None:
+            self.t_last_move = t
+        if not self.ok:
+            self._lost += 1
+            if self.started and self._lost >= 3:
+                self._mark_break(t, "метка потеряна")
+            return
+        self._lost = 0
+        prev = self.L
+        self.L = float(np.hypot(*(self.p2 - self.p1)))
+        if self.L0 is None:                          # база — медиана первых кадров
+            self._base.append(self.L)
+            if len(self._base) >= self.opt.l0_frames:
+                self.L0 = float(np.median(self._base))
+                self._noise = float(np.std(self._base))
+            return
+        if self.neck is not None:
+            self.neck_w = self.neck.measure(gray, self.p1, self.p2)[0]
+        if abs(self.L - self._ref_L) > max(1.0, 3 * self._noise):     # метки ещё движутся
+            self._ref_L = self.L
+            self.t_last_move = t
+        if not self.started and abs(self.L - self.L0) > max(5 * self._noise, 1.0):
+            self.started = True
+        d = self.L - prev
+        if self.started and len(self._diffs) > 15:
+            arr = np.array(self._diffs[-300:])
+            med = np.median(arr)
+            sigma = 1.4826 * np.median(np.abs(arr - med))
+            local = abs(np.median(arr[-15:]))
+            if abs(d - med) > max(self.opt.jump_k * sigma, self.opt.jump_min_px) and abs(d) > self.opt.jump_ratio * local:
+                self._mark_break(t, f"скачок L ({d:+.1f} px)")
+        self._diffs.append(d)
+        if self.started and self.neck is not None and np.isfinite(self.neck_w):
+            self._low_neck = self._low_neck + 1 if self.neck_w <= self.opt.neck_break_px else 0
+            if self._low_neck >= 2:
+                self._mark_break(t, "разрыв перемычки")
+
+    def _mark_break(self, t, reason):
+        if not self.broken:
+            self.broken, self.reason, self.t_break = True, reason, t
+
+
 def summarize(tr, opt, l2=None, log=print):
     """Расчёт L0, разрыва, L2. l2 — индекс строки, если задан вручную."""
     rows = tr.rows
@@ -602,7 +703,7 @@ def summarize(tr, opt, l2=None, log=print):
     k, unit = (scale, "mm") if scale else (1.0, "px")
 
     start = detect_start(L, n0)
-    brk, reason = detect_break(L, ok, NW, opt.jump_k, opt.jump_min_px, opt.neck_break_px, start)
+    brk, reason = detect_break(L, ok, NW, opt.jump_k, opt.jump_min_px, opt.neck_break_px, start, opt.jump_ratio)
     if brk is None:
         valid = np.nonzero(np.isfinite(L))[0]
         auto_l2 = int(valid[-1]) if len(valid) else 0

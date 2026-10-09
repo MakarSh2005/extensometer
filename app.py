@@ -142,6 +142,8 @@ class Camera:
         self.t0 = 0.0
         self.nrec = 0
         self.rec_path = None
+        self.tracker = None
+        self.tracker_error = None
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -177,13 +179,21 @@ class Camera:
             if not ok:
                 self.error = "Камера перестала отдавать кадры."
                 break
+            t_now = time.perf_counter()
             with self.lock:
                 if self.writer is not None:
-                    t = time.perf_counter() - self.t0
+                    t = t_now - self.t0
                     self.writer.write(f)
                     self.tsw.writerow([self.nrec, f"{t:.6f}"])
                     self.nrec += 1
                 self.frame = f
+            trk = self.tracker
+            if trk is not None:                    # живой трекинг меток (ΔL на экране, автостоп)
+                try:
+                    trk.update(f, t_now)
+                except Exception as e:
+                    self.tracker_error = str(e)
+                    self.tracker = None
         self.cap.release()
         self.stop_record()
 
@@ -249,6 +259,9 @@ class App:
         self._photo = None
         self._slider_lock = False
         self.machine = None
+        self.live_pick = False          # выбор меток на живом изображении камеры
+        self.rec_rois = None            # рамки меток на момент начала записи (для автоанализа)
+        self._break_logged = False
         self.merged = None
 
         self._build_ui()
@@ -337,6 +350,24 @@ class App:
         self.lbl_pick = ttk.Label(p2, text="не указаны", foreground="#a51d2d")
         self.lbl_pick.pack(side="left", padx=8)
 
+        pr = ttk.LabelFrame(rp, text=" Запись с камеры ", padding=6)
+        pr.pack(fill="x", pady=(6, 0))
+        self.var_autostop = tk.BooleanVar(value=True)
+        self.var_after = tk.StringVar(value="3")
+        self.var_idle_on = tk.BooleanVar(value=True)
+        self.var_idle = tk.StringVar(value="20")
+        self.var_autoan = tk.BooleanVar(value=True)
+        # автостоп работает, когда метки указаны на живом изображении до начала записи
+        r0 = ttk.Frame(pr)
+        r0.pack(fill="x")
+        ttk.Checkbutton(r0, text="Автостоп через", variable=self.var_autostop).pack(side="left")
+        ttk.Spinbox(r0, from_=1, to=30, width=3, textvariable=self.var_after).pack(side="left", padx=2)
+        ttk.Label(r0, text="с после разрыва").pack(side="left")
+        ttk.Checkbutton(r0, text="или без движения", variable=self.var_idle_on).pack(side="left", padx=(12, 0))
+        ttk.Spinbox(r0, from_=5, to=600, width=4, textvariable=self.var_idle).pack(side="left", padx=2)
+        ttk.Label(r0, text="с").pack(side="left")
+        ttk.Checkbutton(pr, text="После записи сразу запустить анализ", variable=self.var_autoan).pack(anchor="w")
+
         p3 = ttk.LabelFrame(rp, text=" 3. Анализ ", padding=6)
         p3.pack(fill="x", pady=(6, 0))
         self.btn_run = ttk.Button(p3, text="▶ Запустить анализ", style="Big.TButton", command=self.start_analysis)
@@ -382,8 +413,7 @@ class App:
         self.btn_gol2.pack(side="left")
         self.btn_folder = ttk.Button(l2bar, text="📁 Папка результатов", command=self.open_folder, state="disabled")
         self.btn_folder.pack(side="right")
-        ttk.Label(tab, text="Подсказка: листайте кадры ←/→ и проверьте, что в кадре L2 перемычка ещё цела. "
-                            "Клик по графику — переход к этому моменту.", wraplength=480,
+        ttk.Label(tab, text="Клик по графику — переход к этому моменту видео.",
                   foreground="#5e5c64").pack(fill="x")
 
         self.fig = Figure(figsize=(5, 4), dpi=90)
@@ -588,6 +618,11 @@ class App:
                             0.8, (0, 255, 255), 2, cv2.LINE_AA)
             for x, y, rw, rh in (self.rois or []):
                 cv2.rectangle(img, P((x, y)), P((x + rw, y + rh)), (0, 255, 255), 1)
+        if self.live_pick:
+            for k, p in enumerate(self.pick_pts):
+                cv2.drawMarker(img, P(p), (0, 255, 255), cv2.MARKER_CROSS, 26, 2, cv2.LINE_AA)
+                cv2.putText(img, str(k + 1), (P(p)[0] + 12, P(p)[1] - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (0, 255, 255), 2, cv2.LINE_AA)
         if banner:
             cv2.putText(img, banner, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 5, cv2.LINE_AA)
             cv2.putText(img, banner, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
@@ -639,40 +674,82 @@ class App:
         self.log(f"Камера {self.var_cam.get()}: {cw}x{chh} @ {self.camera.fps:.0f} fps")
         self.set_status("Камера включена. Выставьте кадр и фокус, затем «Начать запись» — до старта машины.")
 
-    def toggle_record(self):
+    def toggle_record(self, path=None, reason=None):
         cam = self.camera
         if not cam:
             return
         if not cam.recording:
-            rec_dir = app_dir() / "records"
-            rec_dir.mkdir(exist_ok=True)
-            path = filedialog.asksaveasfilename(
-                title="Куда сохранить запись", initialdir=str(rec_dir),
-                initialfile=f"test_{datetime.now():%Y%m%d_%H%M%S}.avi",
-                defaultextension=".avi", filetypes=[("AVI", "*.avi")])
-            if not path:
-                return
+            if self.picking:
+                self.cancel_picking()
+            if path is None:
+                rec_dir = app_dir() / "records"
+                rec_dir.mkdir(exist_ok=True)
+                path = filedialog.asksaveasfilename(
+                    title="Куда сохранить запись", initialdir=str(rec_dir),
+                    initialfile=f"test_{datetime.now():%Y%m%d_%H%M%S}.avi",
+                    defaultextension=".avi", filetypes=[("AVI", "*.avi")])
+                if not path:
+                    return
+            self.rec_rois = None
+            self._break_logged = False
+            if cam.tracker is not None:
+                # новая база отсчёта ΔL с начала записи; рамки — для анализа видео с первого кадра
+                try:
+                    rois = cam.tracker.rois()
+                    gray = ex.to_gray(cam.frame)
+                    cam.tracker = ex.LiveTracker(gray, rois[0], rois[1], self.opts(),
+                                                 log=lambda m: self.q.put(("log", m)))
+                    self.rec_rois = rois
+                except ValueError as e:
+                    cam.tracker = None
+                    self.log(f"Живой трекинг отключён: {e}")
             try:
                 cam.start_record(path)
             except RuntimeError as e:
                 messagebox.showerror(APP_TITLE, str(e))
                 return
             self.btn_rec.configure(text="⏹ Остановить запись")
+            self.btn_pick.configure(state="disabled")
             self.log(f"Запись: {path}")
-            self.set_status("Идёт запись. Запустите машину; остановите запись после разрыва образца.")
+            if cam.tracker is not None and (self.var_autostop.get() or self.var_idle_on.get()):
+                self.set_status("Идёт запись. Запустите машину — запись остановится сама после разрыва образца.")
+            else:
+                self.set_status("Идёт запись. Запустите машину; остановите запись после разрыва образца. "
+                                "(Чтобы запись останавливалась сама, укажите метки до начала записи.)")
         else:
             path, n, dur = cam.stop_record()
             self.btn_rec.configure(text="⏺ Начать запись")
-            self.log(f"Запись остановлена: {n} кадров за {dur:.1f} с ({n / max(dur, 1e-9):.1f} fps)")
+            self.btn_pick.configure(state="normal")
+            how = f"автоматически: {reason}" if reason else "вручную"
+            self.log(f"Запись остановлена ({how}): {n} кадров за {dur:.1f} с ({n / max(dur, 1e-9):.1f} fps)")
+            rois = self.rec_rois
             if path and n > 0:
                 self.toggle_camera()
                 self.open_video(path)
+                if rois and self.video:
+                    self.rois = rois                 # метки уже известны — указывать заново не нужно
+                    self.pick_frame = 0
+                    self.pick_pts = []
+                    self.lbl_pick.configure(text="перенесены с камеры (кадр 0)", foreground="#26a269")
+                    self.render()
+                    if self.var_autoan.get():
+                        self.start_analysis()
+                    else:
+                        self.set_status("Запись сохранена, метки перенесены. Нажмите «Запустить анализ».")
 
     # ------------------------------------------------------------ метки
     def start_picking(self):
         if self.camera:
-            messagebox.showinfo(APP_TITLE, "Метки указываются на записанном видео. "
-                                           "Остановите запись или откройте видеофайл.")
+            if self.camera.recording:
+                messagebox.showinfo(APP_TITLE, "Метки на живом изображении указываются до начала записи.")
+                return
+            self.camera.tracker = None
+            self.live_pick = True
+            self.picking = True
+            self.pick_pts = []
+            self.canvas.configure(cursor="crosshair")
+            self.lbl_pick.configure(text="кликните по метке 1…", foreground="#c64600")
+            self.set_status("Кликните по ВЕРХНЕЙ метке, затем по НИЖНЕЙ прямо на изображении с камеры. Esc — отмена.")
             return
         if not self.video:
             messagebox.showinfo(APP_TITLE, "Сначала откройте видео или сделайте запись.")
@@ -696,13 +773,22 @@ class App:
     def cancel_picking(self):
         if self.picking:
             self.picking = False
+            self.live_pick = False
             self.pick_pts = []
             self.canvas.configure(cursor="arrow")
             self.lbl_pick.configure(text="не указаны", foreground="#a51d2d")
             self.render()
 
     def on_canvas_click(self, e):
-        if not self.picking or self.cur_frame is None:
+        if not self.picking:
+            return
+        if self.live_pick:
+            if not self.camera:
+                self.cancel_picking()
+                return
+            self.on_live_click(e)
+            return
+        if self.cur_frame is None:
             return
         if self.cur_idx != self.pick_frame:            # кадр сменился во время выбора — начинаем на новом
             self.pick_pts = []
@@ -728,6 +814,85 @@ class App:
             self.log(f"Метки: ROI1={self.rois[0]}, ROI2={self.rois[1]} (кадр {self.pick_frame})")
             self.set_status("Метки указаны (жёлтые рамки должны охватывать точки). Нажмите «Запустить анализ».")
         self.render()
+
+    def on_live_click(self, e):
+        frame = self.camera.frame
+        s, ox, oy = self.view
+        x, y = (e.x - ox) / s, (e.y - oy) / s
+        h, w = frame.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        if self.pick_pts and np.hypot(x - self.pick_pts[0][0], y - self.pick_pts[0][1]) < 15:
+            messagebox.showwarning(APP_TITLE, "Вторая метка почти совпадает с первой. "
+                                              "Кликните по второй метке подальше от первой.")
+            return
+        self.pick_pts.append((x, y))
+        if len(self.pick_pts) == 1:
+            self.lbl_pick.configure(text="кликните по метке 2…")
+            return
+        self.picking = self.live_pick = False
+        self.canvas.configure(cursor="arrow")
+        try:
+            opt = self.opts()
+            gray = ex.to_gray(frame)
+            rois = [ex.roi_from_click(gray, p, not self.var_bright.get()) for p in self.pick_pts]
+            trk = ex.LiveTracker(gray, rois[0], rois[1], opt, log=lambda m: self.q.put(("log", m)))
+        except ValueError as err:
+            self.pick_pts = []
+            self.lbl_pick.configure(text="не указаны", foreground="#a51d2d")
+            messagebox.showerror(APP_TITLE, str(err))
+            return
+        self.pick_pts = []
+        self.camera.tracker = trk
+        self.lbl_pick.configure(text="отслеживаются на камере", foreground="#26a269")
+        self.log(f"Метки на камере: ROI1={rois[0]}, ROI2={rois[1]}")
+        self.set_status("Метки отслеживаются (зелёные крестики). Нажмите «Начать запись» до старта машины.")
+
+    def _live_banner(self, cam):
+        trk = cam.tracker
+        head = f"REC {cam.rec_time():6.1f} s" if cam.recording else "LIVE"
+        if trk is None:
+            return head
+        d = trk.dL()
+        if d is None:
+            txt = "dL: ..." if trk.ok else "MARK LOST"
+        else:
+            l0 = self.opt_l0()
+            txt = f"dL = {d * l0 / trk.L0:.3f} mm" if l0 and trk.L0 else f"dL = {d:.2f} px"
+        if trk.broken:
+            txt += "   BREAK"
+        return f"{head}   {txt}"
+
+    def opt_l0(self):
+        try:
+            v = float(self.var_l0.get().replace(",", "."))
+            return v if v > 0 else None
+        except ValueError:
+            return None
+
+    def _spin(self, var, default):
+        try:
+            return max(0.0, float(var.get().replace(",", ".")))
+        except ValueError:
+            return default
+
+    def _check_autostop(self):
+        cam = self.camera
+        trk = cam.tracker if cam else None
+        if not cam or not cam.recording or trk is None:
+            return
+        now = time.perf_counter()
+        if trk.broken and not self._break_logged:
+            self._break_logged = True
+            self.log(f"Обнаружен разрыв во время записи: {trk.reason}.")
+            if self.var_autostop.get():
+                self.set_status(f"Разрыв обнаружен ({trk.reason}). Запись остановится через "
+                                f"{self._spin(self.var_after, 3):.0f} с.")
+        if self.var_autostop.get() and trk.broken and now - trk.t_break >= self._spin(self.var_after, 3):
+            self.toggle_record(reason=f"после разрыва ({trk.reason})")
+        elif (self.var_idle_on.get() and trk.started and trk.t_last_move is not None
+              and now - trk.t_last_move >= self._spin(self.var_idle, 20)):
+            self.toggle_record(reason=f"метки не двигаются {self._spin(self.var_idle, 20):.0f} с")
 
     # ------------------------------------------------------------ анализ
     def analysis_running(self):
@@ -973,8 +1138,15 @@ class App:
                 self.toggle_camera()
                 messagebox.showerror(APP_TITLE, err)
             else:
-                banner = f"REC {self.camera.rec_time():6.1f} s  ({self.camera.nrec} fr)" if self.camera.recording else "LIVE"
-                self.render(self.camera.frame, banner=banner)
+                cam = self.camera
+                if cam.tracker_error:
+                    self.log(f"Живой трекинг остановлен из-за ошибки: {cam.tracker_error}")
+                    cam.tracker_error = None
+                    self.lbl_pick.configure(text="трекинг остановлен", foreground="#a51d2d")
+                trk = cam.tracker
+                row = dict(p1=trk.p1, p2=trk.p2, ok=trk.ok) if trk is not None else None
+                self.render(cam.frame, row=row, banner=self._live_banner(cam))
+                self._check_autostop()
         elif self.live is not None:
             row, frame = self.live
             self.live = None
