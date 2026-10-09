@@ -1,0 +1,22 @@
+# сборка приложения
+Extensometer/
+build/
+dist/
+*.spec
+*.zip
+
+# видео и результаты испытаний
+records/
+samples/
+*_results/
+*.avi
+*.mp4
+*.mov
+*.ts.csv
+demo/demo_machine.csv
+demo/demo_truth.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
